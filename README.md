@@ -5,9 +5,13 @@ This script automates the process of taking data from PDFs (donor forms, pledge 
 Key Features
 
 -Reads PDF files and extracts relevant text and tables.
+
 -Parses and normalizes fields (e.g., donor name, address, ID, amounts, dates, fund, campaign).
+
 -Maps the extracted data to the exact column layout required by your Andar import template.
+
 -Outputs an Excel file (.xlsx) that’s ready for straight import into Andar.
+
 -Basic validation (e.g., date formats, numeric amounts, required fields).
 
 
