@@ -1,5 +1,4 @@
 
-
 import os
 import re
 from pathlib import Path
@@ -21,8 +20,8 @@ DEFAULT_PLEDGE_EQUALS_PAYMENT = True
 DEFAULT_PERCENTAGE_100 = True
 
 # Optional lookup file to backfill account numbers:
-# Excel with two columns: fullName, ACCOUNTNUMBER
-ACCOUNT_LOOKUP_XLSX = SCRIPT_DIR / "lookup_accounts.xlsx"  # set to None if not using
+# Excel with two columns: fullName, INDACCOUNTNUMBER
+ACCOUNT_LOOKUP_CSV = SCRIPT_DIR / "donor_names_accounts.csv"  # set to None if not using
 
 # Output columns 
 TARGET_COLUMNS = [
@@ -36,26 +35,34 @@ TARGET_COLUMNS = [
     "Individuals.Transactions.DCDetails.DESPERCENTAGE",
     "Source File",
     "Seq",
+    # extra columns from lookup:
+    "Account.fullName",
+    "Account.INDACCOUNTNUMBER",
 ]
 
 # -----------------------------
 # Regex patterns
 # -----------------------------
 # Example line: 5250031143286 JAMES ROBERT BOYD 2727 Check 100.00 4600055
-# Make Name sturdy: it ends right before CheckNumber (a numeric token).
-LINE_PATTERN = re.compile(r"""
+LINE_PATTERN = re.compile(
+    r"""
     (?P<Seq>\d{13})\s+                       # Seq (13 digits)
     (?P<Name>.*?)\s+                         # Name (non-greedy up to next numeric token)
     (?P<CheckNumber>\d{1,10})\s+             # Check number
     (?P<PaymentType>Check|Cash|Card|ACH)\s+  # Payment type
     (?P<Amount>\d+(?:\.\d{2}))\s+            # Amount
     (?P<BatchNumber>\d+)                     # Batch number (ignored after capture)
-""", re.VERBOSE)
+    """,
+    re.VERBOSE,
+)
 
 # GN label can appear as "GN1", "GN-2", "GN 3"
-GN_PATTERN = re.compile(r"""
+GN_PATTERN = re.compile(
+    r"""
     \bGN\s*[- ]?(?P<gn>[1-7])\b
-""", re.IGNORECASE | re.VERBOSE)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 # -----------------------------
@@ -70,6 +77,18 @@ def detect_gn_label_on_page(text: str) -> Optional[str]:
     return f"GN{m.group('gn')}" if m else None
 
 
+def normalize_name_for_lookup(name: str) -> str:
+    """
+    Normalize name to abbreviated form: first initial + last name.
+    E.g., "FREDERICK B HUSSEY" -> "F HUSSEY"
+    """
+    parts = name.upper().strip().split()
+    if len(parts) >= 2:
+        return parts[0][0] + " " + parts[-1]
+    else:
+        return name.upper().strip()
+
+
 def extract_rows_from_pdf(pdf_path: Path, debug: bool = False) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
 
@@ -77,8 +96,6 @@ def extract_rows_from_pdf(pdf_path: Path, debug: bool = False) -> List[Dict[str,
         for page_num, page in enumerate(pdf.pages, start=1):
             # Get text; if your PDFs are scans, text may be empty (OCR needed).
             text = page.extract_text() or ""
-
-            # Process the page line-by-line so GN labels only apply to the same line.
             lines = text.splitlines()
 
             matched_any = False
@@ -102,7 +119,7 @@ def extract_rows_from_pdf(pdf_path: Path, debug: bool = False) -> List[Dict[str,
 
                     row = {
                         "Individuals.ACCOUNTNUMBER": "",  # filled via lookup if provided
-                        "Individuals.fullName": name,
+                        "Individuals.fullName": name,     # name from PDF
                         "Individuals.Transactions.TOTALPLEDGEAMOUNT": pledge,
                         "Individuals.Transactions.TOTALPAYMENTAMOUNT": payment,
                         "Individuals.Transactions.PAYMENTTYPE": pay_type,
@@ -111,12 +128,15 @@ def extract_rows_from_pdf(pdf_path: Path, debug: bool = False) -> List[Dict[str,
                         "Individuals.Transactions.DCDetails.DESPERCENTAGE": percent,
                         "Source File": pdf_path.name,
                         "Seq": seq,
+                        # lookup columns start empty
+                        "Account.fullName": "",
+                        "Account.INDACCOUNTNUMBER": "",
                     }
                     rows.append(row)
+
             if not matched_any:
                 print(f"[WARN] No transaction lines matched on {pdf_path.name} (page {page_num}).")
                 if debug:
-                    # Show candidate snippets around amounts and 13-digit seqs to help debug
                     print("[DEBUG] Page text snippet (first 300 chars):")
                     page_text_flat = re.sub(r"\s+", " ", text).strip()
                     print(page_text_flat[:300])
@@ -141,30 +161,64 @@ def extract_rows_from_pdf(pdf_path: Path, debug: bool = False) -> List[Dict[str,
 
 
 def load_account_lookup(path: Optional[Path]) -> Optional[pd.DataFrame]:
+    """
+    Load CSV mapping fullName -> INDACCOUNTNUMBER.
+
+    Expected columns in CSV:
+        - fullName
+        - INDACCOUNTNUMBER
+    """
     if path and path.exists():
-        df = pd.read_excel(path, engine="openpyxl")
-        # Expect columns: fullName, ACCOUNTNUMBER
+        df = pd.read_csv(path, encoding='latin1')
         df = df.rename(columns={c: c.strip() for c in df.columns})
-        if not {"fullName", "ACCOUNTNUMBER"} <= set(df.columns):
-            print("[WARN] Lookup file missing required columns: fullName, ACCOUNTNUMBER")
+
+        required = {"fullName", "INDACCOUNTNUMBER"}
+        if not required.issubset(set(df.columns)):
+            print("[WARN] Lookup file missing required columns: fullName, INDACCOUNTNUMBER")
+            print(f"[WARN] Columns found: {df.columns.tolist()}")
             return None
-        # Normalize names to uppercase to match report style
-        df["fullName_key"] = df["fullName"].astype(str).str.upper().str.strip()
-        return df[["fullName_key", "ACCOUNTNUMBER"]].drop_duplicates()
+
+        # Create abbreviated key: first initial + last name
+        df["abbrev_key"] = df["INDFIRSTNAME"].astype(str).str[0].str.upper() + " " + df["INDLASTNAME"].astype(str).str.upper().str.strip()
+        # Keep keys + fullName + INDACCOUNTNUMBER for later
+        return df[["abbrev_key", "fullName", "INDACCOUNTNUMBER"]].drop_duplicates(subset="abbrev_key")
+
+    if path:
+        print(f"[WARN] Lookup file {path} not found.")
     return None
 
 
 def apply_account_lookup(df: pd.DataFrame, lookup_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    if lookup_df is None:
+    """
+    Use Excel (fullName, INDACCOUNTNUMBER) to:
+      - fill Individuals.ACCOUNTNUMBER
+      - add Account.fullName and Account.INDACCOUNTNUMBER columns to the output.
+    """
+    if lookup_df is None or lookup_df.empty or df.empty:
         return df
-    df["fullName_key"] = df["Individuals.fullName"].astype(str).str.upper().str.strip()
-    df = df.merge(lookup_df, on="fullName_key", how="left")
-    # Fill account numbers where found
-    df["Individuals.ACCOUNTNUMBER"] = df["Individuals.ACCOUNTNUMBER"].mask(
-        df["Individuals.ACCOUNTNUMBER"].eq(""),
-        df["ACCOUNTNUMBER"]
-    )
-    df = df.drop(columns=["fullName_key", "ACCOUNTNUMBER"])
+
+    # Build join key in main df from the PDF name
+    df["abbrev_key"] = df["Individuals.fullName"].apply(normalize_name_for_lookup)
+
+    before_empty = df["Individuals.ACCOUNTNUMBER"].eq("").sum()
+
+    # Merge lookup on abbrev_key
+    df = df.merge(lookup_df, on="abbrev_key", how="left")
+
+    # Fill Individuals.ACCOUNTNUMBER where currently empty and we have a match
+    mask_condition = df["Individuals.ACCOUNTNUMBER"].eq("") & df["INDACCOUNTNUMBER"].notna()
+    df["Individuals.ACCOUNTNUMBER"] = df["Individuals.ACCOUNTNUMBER"].mask(mask_condition, df["INDACCOUNTNUMBER"])
+
+    after_empty = df["Individuals.ACCOUNTNUMBER"].eq("").sum()
+    filled = before_empty - after_empty
+    print(f"[INFO] Account lookup filled {filled} ACCOUNTNUMBER values.")
+
+    # Copy lookup data into the dedicated output columns
+    df["Account.fullName"] = df["fullName"].fillna("")
+    df["Account.INDACCOUNTNUMBER"] = df["INDACCOUNTNUMBER"].fillna("")
+
+    # Drop helper columns from join
+    df = df.drop(columns=["abbrev_key", "fullName", "INDACCOUNTNUMBER"])
     return df
 
 
@@ -209,7 +263,7 @@ def main():
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Optional account number lookup
-    lookup_df = load_account_lookup(ACCOUNT_LOOKUP_XLSX if ACCOUNT_LOOKUP_XLSX else None)
+    lookup_df = load_account_lookup(ACCOUNT_LOOKUP_CSV if ACCOUNT_LOOKUP_CSV else None)
     df = apply_account_lookup(df, lookup_df)
 
     # Simple validation prints before saving
@@ -217,10 +271,17 @@ def main():
     print("[INFO] GN distribution:")
     print(df["Individuals.Transactions.DCDetails.BOOKLABEL"].value_counts(dropna=False))
 
+    print("[INFO] Sample of names + accounts after lookup:")
+    print(df[["Individuals.fullName", "Individuals.ACCOUNTNUMBER", "Account.fullName", "Account.INDACCOUNTNUMBER"]].head(10))
+
+    # Remove any duplicate rows
+    df = df.drop_duplicates()
+
     # Save to Excel
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Extracted")
     print(f"[DONE] Saved {len(df)} rows to {OUTPUT_XLSX}")
+
 
 if __name__ == "__main__":
     main()
